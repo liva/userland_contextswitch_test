@@ -46,26 +46,56 @@ void interrupt(pid_t pid, uint64_t handler) {
   exit_if_error(ptrace(PTRACE_SETREGS, pid, NULL, &data), "getregs");
 }
 
+uint64_t handler = 0;
+bool interrupt_disable = false;
+
+void handle_hypercall(pid_t pid, int status) {
+  if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+    struct user_regs_struct data;
+    exit_if_error(ptrace(PTRACE_GETREGS, pid, NULL, &data), "getregs");
+    
+    switch(data.rax) {
+    case 1:
+      std::cout << "handler address is " << std::hex << data.rbx << "." << std::endl;
+      handler = data.rbx;
+      break;
+    case 2:
+      interrupt_disable = true;
+      break;
+    case 3:
+      interrupt_disable = false;
+      break;
+    default:
+      std::cout << "unknown hypercall" << std::endl;
+      exit(1);
+    }
+  } else if (WIFEXITED(status)) {
+    exit(0);
+  } else if (WIFSIGNALED(status)) {
+    exit(1);
+  } else {
+    // ignore other signals
+  }
+}
+
 void stop_tracee(pid_t pid) {
   int status;
   exit_if_error(kill(pid, SIGSTOP), "kill");
 
   while(true) {
     exit_if_error(waitpid(pid, &status, 0), "waitpid");
-    
-    if (WIFSTOPPED(status)) {
-      if (WSTOPSIG(status) == SIGSTOP) {
-	// the signal has been properly delivered.
-	break;
-      }
-    } else {
-      std::cout << "could not stop tracee process." << std::endl;
-      exit(1);
+
+    if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP) {
+      // the signal has been properly delivered.
+      break;
     }
+
+    handle_hypercall(pid, status);
 
     continue_tracee(pid);
   }
 }
+
 
 int main(int argc, const char **argv) {
   pid_t pid;
@@ -90,49 +120,28 @@ int main(int argc, const char **argv) {
     std::cout << "unknown error (no SIGTRAP)" << std::endl;
     exit(1);
   }
-
   continue_tracee(pid);
 
-  exit_if_error(waitpid(pid, &status, 0), "waitpid");
+  static const int kTimeSlice = 30;
+  int timeout = kTimeSlice;
+  while(true) {
+    if (waitpid(pid, &status, WNOHANG) != 0) {
+      // handle signals if tracee has been stopped.
+      handle_hypercall(pid, status);
+      continue_tracee(pid);
+    }
 
-  uint64_t handler;
-  if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
-    struct user_regs_struct data;
-    exit_if_error(ptrace(PTRACE_GETREGS, pid, NULL, &data), "getregs");
-    
-    std::cout << "handler address is " << std::hex << data.rax << "." << std::endl;
-    handler = data.rax;
-  } else {
-    std::cout << "please set handler address" << std::endl;
-    exit(1);
-  }
+    usleep(100 * 1000); // 100ms sleep
 
-  continue_tracee(pid);
-
-  // interrupt 5 times with 4 seconds interval
-  for(int i = 0; i < 5; i++) {
-    // to ignore all signals and continue, invoke PTRACE_CONT periodically
-    for(int j = 0; j < 4; j++) {
-      if (waitpid(pid, &status, WNOHANG) != 0) {
-	continue_tracee(pid);
-      }
-      sleep(1);
+    if (timeout > 0) {
+      timeout--;
     }
     
-    stop_tracee(pid);
-
-    interrupt(pid, handler);
-    continue_tracee(pid);
-  }
-
-  while(true) {
-    exit_if_error(waitpid(pid, &status, 0), "waitpid");
-    if (WIFEXITED(status)) {
-      return 0;
-    } else if (WIFSIGNALED(status)) {
-      return 1;
-    } else {
+    if (timeout == 0 && !interrupt_disable) {
+      stop_tracee(pid);
+      interrupt(pid, handler);
       continue_tracee(pid);
+      timeout = kTimeSlice;
     }
   }
 }
