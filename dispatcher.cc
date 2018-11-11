@@ -33,7 +33,15 @@ void continue_tracee(pid_t pid) {
   exit_if_error(ptrace(PTRACE_CONT, pid, NULL, NULL), "cont");
 }
 
-void interrupt(pid_t pid, uint64_t handler) {
+uint64_t handler = 0;
+bool interrupt_disable = false;
+
+void interrupt(pid_t pid) {
+  if (handler == 0) {
+    std::cout << "please initialize handler before enable interrupt." << std::endl;
+    exit(1);
+  }
+
   struct user_regs_struct data;
   exit_if_error(ptrace(PTRACE_GETREGS, pid, NULL, &data), "getregs");
 
@@ -46,9 +54,6 @@ void interrupt(pid_t pid, uint64_t handler) {
   exit_if_error(ptrace(PTRACE_SETREGS, pid, NULL, &data), "getregs");
 }
 
-uint64_t handler = 0;
-bool interrupt_disable = false;
-
 void handle_hypercall(pid_t pid, int status) {
   if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
     struct user_regs_struct data;
@@ -56,13 +61,16 @@ void handle_hypercall(pid_t pid, int status) {
     
     switch(data.rax) {
     case 1:
+      // set handler address
       std::cout << "handler address is " << std::hex << data.rbx << "." << std::endl;
       handler = data.rbx;
       break;
     case 2:
+      // disable interrupt
       interrupt_disable = true;
       break;
     case 3:
+      // enable interrupt
       interrupt_disable = false;
       break;
     default:
@@ -105,7 +113,7 @@ int main(int argc, const char **argv) {
     exit_if_error(ptrace(PTRACE_TRACEME, 0, NULL, NULL), "traceme");
 
     // execl will invoke SIGTRAP and send it to the parent process
-    exit_if_error(execl("test", "test", NULL), "execl");
+    exit_if_error(execl("worker", "worker", NULL), "execl");
   }
 
   // parent process (tracer)
@@ -139,7 +147,7 @@ int main(int argc, const char **argv) {
     
     if (timeout == 0 && !interrupt_disable) {
       stop_tracee(pid);
-      interrupt(pid, handler);
+      interrupt(pid);
       continue_tracee(pid);
       timeout = kTimeSlice;
     }
